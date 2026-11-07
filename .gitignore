@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+results.csv
+*.png
+*.nsys-rep
+imagenette2-320*/
+videos*/

@@ -1,0 +1,9 @@
+--extra-index-url https://pypi.nvidia.com
+nvidia-dali-cuda120
+torch
+torchvision
+nvidia-ml-py
+psutil
+av
+pandas
+matplotlib
