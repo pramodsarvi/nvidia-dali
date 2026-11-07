@@ -2,6 +2,7 @@
 import sys
 from nvidia.dali import pipeline_def, fn, types
 from nvidia.dali.auto_aug import rand_augment
+from nvidia.dali.pipeline.experimental import pipeline_def as debug_pipeline_def  # debug= lives here in DALI 2.x
 
 MEAN = [123.7, 116.3, 103.5]; STD = [58.4, 57.1, 57.4]
 
@@ -26,7 +27,7 @@ def randaug_pipeline(data_dir):
                                       mean=MEAN, std=STD)
     return images, labels.gpu()
 
-@pipeline_def(debug=True)
+@debug_pipeline_def(debug=True)
 def debug_pipeline(data_dir):
     jpegs, labels = fn.readers.file(file_root=data_dir)
     images = fn.decoders.image(jpegs, device="cpu")

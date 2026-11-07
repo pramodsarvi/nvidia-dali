@@ -204,17 +204,17 @@ class PyAVClipDataset(Dataset):
         return (clip - KINETICS_MEAN) / KINETICS_STD, label
 
 
-def torch_video_loader(data, bs, workers):
-    dl = DataLoader(PyAVClipDataset(data), batch_size=bs, shuffle=True, drop_last=True,
+def torch_video_loader(data, bs, workers, seq_len=16):
+    dl = DataLoader(PyAVClipDataset(data, seq_len=seq_len), batch_size=bs, shuffle=True, drop_last=True,
                     num_workers=workers, pin_memory=True, persistent_workers=True,
                     prefetch_factor=2)
     get_xy = lambda b: (b[0].cuda(non_blocking=True), b[1].cuda(non_blocking=True))
     return dl, get_xy
 
 
-def dali_video_loader(data, bs, workers):
-    pipe = video_train_pipeline(video_root=data, batch_size=bs, num_threads=workers,
-                                device_id=0, seed=0)
+def dali_video_loader(data, bs, workers, seq_len=16):
+    pipe = video_train_pipeline(video_root=data, seq_len=seq_len, batch_size=bs,
+                                num_threads=workers, device_id=0, seed=0)
     pipe.build()
     it = DALIGenericIterator(pipe, ["video", "label"], reader_name="Reader",
                              last_batch_policy=LastBatchPolicy.DROP, auto_reset=True)
@@ -241,6 +241,7 @@ def main():
     p.add_argument("--data", required=True)
     p.add_argument("--workers", type=int, nargs="+", default=[8])
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--seq-len", type=int, default=16, help="frames per clip (video only)")
     p.add_argument("--loaders", nargs="+", default=["pytorch", "dali"])
     p.add_argument("--e2e", action="store_true", help="include a real training step")
     p.add_argument("--warmup", type=int, default=10)
@@ -257,14 +258,15 @@ def main():
         for name in args.loaders:
             print(f"> {args.modality} | {name:7s} | workers={workers} | bs={bs} | "
                   f"{'e2e' if args.e2e else 'loader-only'}", flush=True)
-            loader, get_xy = LOADERS[args.modality][name](args.data, bs, workers)
+            extra = {"seq_len": args.seq_len} if args.modality == "video" else {}
+            loader, get_xy = LOADERS[args.modality][name](args.data, bs, workers, **extra)
             step = make_train_step(MODELS[args.modality]()) if args.e2e else noop_step
             res = measure(loader, get_xy, step, bs, args.warmup, args.iters, args.repeats)
             row = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "gpu": gpu_name(), "cpus": len(os.sched_getaffinity(0)),
                 "modality": args.modality, "loader": name, "workers": workers,
-                "batch_size": bs, "mode": "e2e" if args.e2e else "loader-only", **res,
+                "batch_size": bs, "seq_len": args.seq_len if args.modality == "video" else "", "mode": "e2e" if args.e2e else "loader-only", **res,
             }
             rows.append(row)
             print(f"  {res['samples_per_s']:.0f} samples/s  "

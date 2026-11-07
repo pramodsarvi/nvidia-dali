@@ -5,3 +5,4 @@ results.csv
 *.nsys-rep
 imagenette2-320*/
 videos*/
+!images/*.png

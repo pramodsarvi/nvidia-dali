@@ -4,6 +4,26 @@
 
 ---
 
+## TL;DR
+
+I ran every script in this tutorial on one NVIDIA L40S, limited to 8 CPU cores (one GPU's usual share of a server). Full details are in section 13.6.
+
+| Workload | PyTorch | DALI | Speedup |
+|---|---|---|---|
+| Images, data loading only (8 workers) | 2,805 img/s | 19,086 img/s | **6.8×** |
+| Images, data loading only (2 workers) | 952 img/s | 17,781 img/s | **18.7×** |
+| Images, ResNet-50 training | 1,110 img/s | 1,204 img/s | 1.08× |
+| Video clips, data loading only (8 workers) | 96 clips/s | 126 clips/s | **1.3×** |
+| Video clips, data loading only (4 workers) | 65 clips/s | 126 clips/s | **1.9×** |
+| Video clips, R(2+1)D-18 training | 62 clips/s | 109 clips/s | **1.8×** |
+
+Two things to take from this table:
+
+1. **DALI removes the data-loading bottleneck.** Loading is 7–19× faster for images and 1.3–1.9× faster for video, and it barely needs CPU cores (2–4 workers are already enough).
+2. **That only speeds up training if loading was the bottleneck.** ResNet-50 on this GPU is already limited by the model, so image training is only 8% faster. The video model is much more demanding on the input side, so training gets 1.8× faster. Section 13.7 explains how to tell which case you are in.
+
+---
+
 ## 1. The problem: your GPU is starving
 
 Modern GPUs can process thousands of images per second. A typical PyTorch input pipeline looks like this:
@@ -536,6 +556,14 @@ torchrun --nproc_per_node=4 train_dali.py --data imagenette2-320 --epochs 5
 
 Not every dataset is a folder of JPEGs. Your data might be in a database, in S3, or listed in a CSV with complex labels. `fn.external_source` lets **you** provide the raw data from Python while DALI still does the heavy GPU work.
 
+`train.csv` is a plain CSV with a header and one row per image, with absolute (or working-directory-relative) paths and integer labels:
+
+```
+path,label
+/data/imagenette2-320/train/n01440764/img_001.JPEG,0
+/data/imagenette2-320/train/n02102040/img_002.JPEG,1
+```
+
 ```python
 # step5_external_source.py
 import numpy as np
@@ -618,7 +646,7 @@ from torch.utils.data import DataLoader
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from train_dali import create_pipeline   # reuse the pipeline from Step 4
 
-DATA, BS, WORKERS, N_BATCHES = "imagenette2-320/train", 256, 8, 50
+DATA, BS, WORKERS, N_BATCHES = "imagenette2-320/train", 256, 8, 30
 
 def bench(loader, name, get_x):
     it = iter(loader)
@@ -644,7 +672,14 @@ dali = DALIGenericIterator(pipe, ["data", "label"], reader_name="Reader", auto_r
 bench(dali, "DALI", lambda b: b[0]["data"])
 ```
 
-How much faster DALI is depends a lot on your CPU-to-GPU ratio, image resolution, and GPU model. The speedup is largest when there are **few CPU cores per GPU** and **large JPEGs**. With small images and many cores, the difference can be small. That is why you should benchmark before you migrate.
+On my machine (L40S, 8 workers, Imagenette, batch 256) this script printed:
+
+```
+  DataLoader:     4415 img/s
+        DALI:    19197 img/s
+```
+
+That is about 4.3× faster. How much faster DALI is depends a lot on your CPU-to-GPU ratio, image resolution, and GPU model. The speedup is largest when there are **few CPU cores per GPU** and **large JPEGs**. With small images and many cores, the difference can be small. That is why you should benchmark before you migrate.
 
 This script is a quick sanity check. Section 13 covers a complete benchmarking method for both images and video, including GPU/CPU utilization, end-to-end training throughput, and a results table you can fill in.
 
@@ -734,7 +769,10 @@ Because the pipeline is a graph, you can't normally `print()` intermediate value
 
 ```python
 # 1. Debug mode: runs eagerly, so you can print and inspect intermediate results
-@pipeline_def(debug=True)
+#    (the debug= flag lives in the experimental pipeline_def)
+from nvidia.dali.pipeline.experimental import pipeline_def as debug_pipeline_def
+
+@debug_pipeline_def(debug=True)
 def dbg(data_dir):
     jpegs, labels = fn.readers.file(file_root=data_dir)
     images = fn.decoders.image(jpegs, device="cpu")
@@ -1054,7 +1092,7 @@ def embed_videos(filenames, batch_size=4, seq_len=8):
     return results
 ```
 
-Because DALI decodes clips that come one after another, NVDEC reads each video almost sequentially, and seeking costs very little. On a modern data-center GPU this can be several times faster than decoding with FFmpeg on the CPU. Benchmark it on your own videos to get real numbers.
+Because DALI decodes clips that come one after another, NVDEC reads each video almost sequentially, and seeking costs very little. On a modern data-center GPU this is clearly faster than decoding with FFmpeg on the CPU: in my test (section 13.6, L40S, 8 cores) data loading was 1.3–1.9× faster and R(2+1)D training was 1.8× faster. Benchmark it on your own videos to get real numbers.
 
 ### 12.6 Decoding videos you already have in memory
 
@@ -1089,7 +1127,7 @@ This decodes **whole** videos, so keep them short (for example clips that were a
 
 ## 13. Step 8: Benchmarking properly (images and video)
 
-Claims like "DALI is 3× faster" don't mean much until you've measured it on **your** data, **your** GPU, and **your** CPU budget. This section gives you a repeatable method and a single script that produces a results table.
+Claims like "DALI is 3× faster" (or the numbers in my own TL;DR) don't mean much until you've measured it on **your** data, **your** GPU, and **your** CPU budget. This section gives you a repeatable method and a single script that produces a results table.
 
 ### 13.1 What to measure
 
@@ -1330,17 +1368,17 @@ class PyAVClipDataset(Dataset):
         return (clip - KINETICS_MEAN) / KINETICS_STD, label
 
 
-def torch_video_loader(data, bs, workers):
-    dl = DataLoader(PyAVClipDataset(data), batch_size=bs, shuffle=True, drop_last=True,
+def torch_video_loader(data, bs, workers, seq_len=16):
+    dl = DataLoader(PyAVClipDataset(data, seq_len=seq_len), batch_size=bs, shuffle=True, drop_last=True,
                     num_workers=workers, pin_memory=True, persistent_workers=True,
                     prefetch_factor=2)
     get_xy = lambda b: (b[0].cuda(non_blocking=True), b[1].cuda(non_blocking=True))
     return dl, get_xy
 
 
-def dali_video_loader(data, bs, workers):
-    pipe = video_train_pipeline(video_root=data, batch_size=bs, num_threads=workers,
-                                device_id=0, seed=0)
+def dali_video_loader(data, bs, workers, seq_len=16):
+    pipe = video_train_pipeline(video_root=data, seq_len=seq_len, batch_size=bs,
+                                num_threads=workers, device_id=0, seed=0)
     pipe.build()
     it = DALIGenericIterator(pipe, ["video", "label"], reader_name="Reader",
                              last_batch_policy=LastBatchPolicy.DROP, auto_reset=True)
@@ -1367,6 +1405,7 @@ def main():
     p.add_argument("--data", required=True)
     p.add_argument("--workers", type=int, nargs="+", default=[8])
     p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--seq-len", type=int, default=16, help="frames per clip (video only)")
     p.add_argument("--loaders", nargs="+", default=["pytorch", "dali"])
     p.add_argument("--e2e", action="store_true", help="include a real training step")
     p.add_argument("--warmup", type=int, default=10)
@@ -1383,14 +1422,15 @@ def main():
         for name in args.loaders:
             print(f"> {args.modality} | {name:7s} | workers={workers} | bs={bs} | "
                   f"{'e2e' if args.e2e else 'loader-only'}", flush=True)
-            loader, get_xy = LOADERS[args.modality][name](args.data, bs, workers)
+            extra = {"seq_len": args.seq_len} if args.modality == "video" else {}
+            loader, get_xy = LOADERS[args.modality][name](args.data, bs, workers, **extra)
             step = make_train_step(MODELS[args.modality]()) if args.e2e else noop_step
             res = measure(loader, get_xy, step, bs, args.warmup, args.iters, args.repeats)
             row = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "gpu": gpu_name(), "cpus": len(os.sched_getaffinity(0)),
                 "modality": args.modality, "loader": name, "workers": workers,
-                "batch_size": bs, "mode": "e2e" if args.e2e else "loader-only", **res,
+                "batch_size": bs, "seq_len": args.seq_len if args.modality == "video" else "", "mode": "e2e" if args.e2e else "loader-only", **res,
             }
             rows.append(row)
             print(f"  {res['samples_per_s']:.0f} samples/s  "
@@ -1440,14 +1480,14 @@ for (modality, mode), g in df.groupby(["modality", "mode"]):
 
 ```bash
 # 1. Images, input pipeline only, sweeping workers, limited to 8 cores (one GPU's share)
-taskset -c 0-7 python benchmark.py image --data imagenette2-320/train --workers 2 4 8
+taskset -c 0-7 python benchmark.py image --data imagenette2-320/train --workers 2 4 8 --batch-size 128
 
 # 2. Images, end-to-end with ResNet-50 training steps
-taskset -c 0-7 python benchmark.py image --data imagenette2-320/train --workers 8 --e2e
+taskset -c 0-7 python benchmark.py image --data imagenette2-320/train --workers 8 --batch-size 128 --e2e
 
 # 3. Video, input pipeline only, and end-to-end with R(2+1)D-18
-taskset -c 0-7 python benchmark.py video --data videos_cfr/train --workers 4 8
-taskset -c 0-7 python benchmark.py video --data videos_cfr/train --workers 8 --e2e
+taskset -c 0-7 python benchmark.py video --data videos_cfr/train --workers 4 8 --batch-size 8
+taskset -c 0-7 python benchmark.py video --data videos_cfr/train --workers 8 --batch-size 8 --e2e
 
 # 4. Charts
 python plot_results.py
@@ -1457,22 +1497,46 @@ nsys profile -t cuda,nvtx,osrt -o dali_e2e \
   python benchmark.py image --data imagenette2-320/train --workers 8 --e2e --repeats 1
 ```
 
-### 13.6 Results template
+### 13.6 Results
 
-Fill this in with your own numbers and include it in your post together with the hardware details. **Don't copy speedups from elsewhere.** They depend on hardware and data.
+These are the numbers from running section 13.5 on my machine. Yours will differ, so fill in the same table for your own hardware.
 
-**Setup:** GPU: `____` · CPU: `____` (cores used: `__`) · Storage: `____` · DALI `__` · PyTorch `__` · Dataset: `____`
+**Setup:** GPU: NVIDIA L40S (46 GB) · CPU: AMD EPYC 9354, restricted to 8 cores with `taskset -c 0-7` · Storage: local disk, warm page cache · DALI 2.4.0 · PyTorch 2.8.0 (CUDA 12.8) · Image data: Imagenette2-320 train (9,469 JPEGs, batch 128) · Video data: 42 clips of 20 s each (about 25,000 frames), cut from three open-licensed Blender films (*Big Buck Bunny*, *Sintel*, *Tears of Steel*) that I downloaded from YouTube at 1080p H.264 (24 and 60 fps sources, 2 aspect ratios) with `yt-dlp`, then re-encoded as in section 12.2 (30 fps, 256 px short side, keyframe every 16 frames), 16-frame clips, batch 8. This mimics a real ingestion pipeline: download, normalize, train. Each number is the mean ± std over 3 repeats.
+
+**Images, data loading only** (no model):
+
+| Workers | PyTorch (img/s) | DALI (img/s) | Speedup |
+|---|---|---|---|
+| 2 | 952 ± 10 | 17,781 ± 386 | 18.7× |
+| 4 | 1,709 ± 66 | 18,964 ± 150 | 11.1× |
+| 8 | 2,805 ± 879 | 19,086 ± 454 | 6.8× |
+
+**Everything together:**
 
 | Workload | Loader | Workers | Throughput | GPU util | CPU util | Peak GPU mem | Speedup |
 |---|---|---|---|---|---|---|---|
-| Image, loader-only | PyTorch | 8 | | | | | 1.0× |
-| Image, loader-only | DALI | 8 | | | | | |
-| Image, ResNet-50 e2e | PyTorch | 8 | | | | | 1.0× |
-| Image, ResNet-50 e2e | DALI | 8 | | | | | |
-| Video, loader-only | PyTorch (PyAV) | 8 | | | | | 1.0× |
-| Video, loader-only | DALI (NVDEC) | 8 | | | | | |
-| Video, R(2+1)D e2e | PyTorch (PyAV) | 8 | | | | | 1.0× |
-| Video, R(2+1)D e2e | DALI (NVDEC) | 8 | | | | | |
+| Image, loader-only | PyTorch | 8 | 2,805 img/s | 6% | 12% | 1.6 GB | 1.0× |
+| Image, loader-only | DALI | 8 | 19,086 img/s | 24% | 10% | 1.7 GB | 6.8× |
+| Image, ResNet-50 e2e | PyTorch | 8 | 1,110 img/s | 92% | 10% | 7.8 GB | 1.0× |
+| Image, ResNet-50 e2e | DALI | 8 | 1,204 img/s | 98% | 8% | 8.2 GB | 1.08× |
+| Video, loader-only | PyTorch (PyAV) | 8 | 96 clips/s | 1% | 12% | 1.4 GB | 1.0× |
+| Video, loader-only | DALI (NVDEC) | 8 | 126 clips/s | 2% | 7% | 1.4 GB | 1.3× |
+| Video, R(2+1)D e2e | PyTorch (PyAV) | 8 | 62 clips/s | 40% | 11% | 4.0 GB | 1.0× |
+| Video, R(2+1)D e2e | DALI (NVDEC) | 8 | 109 clips/s | 72% | 15% | 4.3 GB | 1.8× |
+
+**What these numbers say** (using the table in section 13.7):
+
+- **Images, loader-only:** DALI delivers about 19,000 img/s no matter how many workers it gets. The PyTorch loader grows with workers (952 → 2,805 img/s) but is still 6.8× slower at 8 workers, and its numbers vary a lot between runs at 8 workers (± 879).
+- **Images, end-to-end:** DALI is only 8% faster. DALI could feed about 19,000 img/s, but ResNet-50 training tops out near 1,200 img/s, so the model is the bottleneck (DALI GPU util 98%). The PyTorch run is already at 92% GPU utilization, so on this machine with 8 cores the CPU loader was almost keeping up. A slower CPU, fewer cores, or a lighter model would show a larger gain.
+- **Video:** DALI helps most in training: 1.8× in end-to-end throughput, with GPU utilization going from 40% to 72%. In loader-only mode the PyTorch (PyAV) loader scales with workers (65 clips/s at 4, 96 at 8), while DALI stays at about 126 clips/s from 4 workers on, so DALI's advantage shrinks from 1.9× to 1.3× when the CPU has more cores to spend.
+
+**Caveats, so you don't over-read this:**
+
+- One GPU model, one CPU, one dataset. Imagenette images are small (320 px); full-size ImageNet JPEGs are about 10× larger, which usually favors DALI more.
+- The video set is small (42 clips, 3 films, all animation) and sits in the page cache. Real footage (more motion, more noise) is harder to decode, so treat the video numbers as relative, not absolute.
+- **DALI is not hardware-limited in the video loader-only test.** While it ran at 126 clips/s I sampled the GPU with `nvidia-smi dmon -s u`: the hardware video decoder (NVDEC) was about 32% busy and the GPU's compute units about 2%. So the plateau comes from something else, such as how the reader seeks and schedules clips, not from a full GPU. I did not dig further.
+- The GPU utilization column is sampled by NVML in a background thread. For loader-only runs it is low because the GPU is mostly idle, not because DALI is idle.
+- I did not tune either loader beyond the settings in the scripts.
 
 ### 13.7 How to read the results
 
@@ -1485,6 +1549,228 @@ Fill this in with your own numbers and include it in your post together with the
 | DALI e2e is slightly *lower* than PyTorch | The DALI GPU work competes with the model for the GPU, or the model barely fits in memory. | Move some augmentations to the CPU (decode on GPU, augment on CPU), lower `prefetch_queue_depth`, or raise `hw_decoder_load` so the hardware decoder does more of the work. |
 | Video: DALI far ahead even with many workers | Decoding video on the CPU costs far more than decoding JPEGs. | Expected. NVDEC is dedicated hardware. |
 | Video: DALI throughput drops on some datasets | Large keyframe intervals or high resolution make each seek expensive. | Re-encode the videos (section 12.2). |
+
+### 13.8 Decoding every frame: CPU vs FFmpeg-GPU vs DALI (1080p and 720p)
+
+The benchmarks above sample *clips* (16 frames, every second frame). Many video jobs instead need **every frame**: frame extraction, embeddings, transcoding, labeling. For that, the question is raw decode throughput, with no resize, crop or model. `decode_all_frames.py` decodes every frame of every video three ways and reports frames per second:
+
+- **CPU:** FFmpeg software decoding, 8 processes with 1 thread each (8 cores in total).
+- **FFmpeg GPU:** the same 8 processes with `-hwaccel cuda -hwaccel_output_format cuda`, so decoding runs on NVDEC and the frames stay in GPU memory.
+- **DALI:** `fn.readers.video(device="gpu", stride=1, step=sequence_length)`, which also uses NVDEC and returns consecutive, non-overlapping sequences, so each frame is delivered once and stays on the GPU.
+
+```bash
+taskset -c 0-7 python decode_all_frames.py --data videos_1080/train --label 1080p --out decode_results.csv
+taskset -c 0-7 python decode_all_frames.py --data videos_720/train  --label 720p  --out decode_results.csv
+python plot_decode.py decode_results.csv images/
+```
+
+<details><summary>decode_all_frames.py</summary>
+
+```python
+#!/usr/bin/env python
+"""Decode EVERY frame of every video three ways and compare frames/s.
+
+  cpu     : FFmpeg software decoding, N parallel processes (1 thread each)
+  ffmpeg-gpu : FFmpeg with NVDEC (-hwaccel cuda), N parallel processes, frames stay on GPU
+  dali    : DALI fn.readers.video (NVDEC), every frame (stride=1, non-overlapping
+            sequences of `--seq-len` frames), frames stay on GPU
+
+No resizing, cropping or augmentation: this isolates pure decode throughput.
+
+  python decode_all_frames.py --data videos_1080/train --workers 8
+"""
+import argparse, os, re, statistics, subprocess, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
+
+import pynvml
+
+
+def list_videos(root):
+    out = []
+    for dp, _, fs in os.walk(root):
+        out += [os.path.join(dp, f) for f in fs if f.endswith((".mp4", ".mkv", ".mov"))]
+    return sorted(out)
+
+
+class DecoderMeter:
+    """Samples NVDEC utilisation (%) in the background."""
+    def __init__(self):
+        pynvml.nvmlInit()
+        self.h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        self.vals, self.stop = [], threading.Event()
+
+    def __enter__(self):
+        def run():
+            while not self.stop.is_set():
+                self.vals.append(pynvml.nvmlDeviceGetDecoderUtilization(self.h)[0])
+                time.sleep(0.2)
+        self.t = threading.Thread(target=run, daemon=True); self.t.start(); return self
+
+    def __exit__(self, *a):
+        self.stop.set(); self.t.join()
+
+    @property
+    def mean(self):
+        return statistics.mean(self.vals) if self.vals else 0.0
+
+
+def _ffmpeg(path, gpu):
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-threads", "1"]
+    if gpu:
+        cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+    cmd += ["-i", path, "-an", "-progress", "pipe:1", "-f", "null", "-"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr[-500:])
+    return int(re.findall(r"frame=(\d+)", r.stdout)[-1])
+
+
+def run_ffmpeg(files, workers, gpu):
+    with ThreadPoolExecutor(workers) as ex:
+        return sum(ex.map(lambda f: _ffmpeg(f, gpu), files))
+
+
+def make_dali(data, workers, seq_len, batch_size):
+    from nvidia.dali import pipeline_def, fn
+
+    @pipeline_def
+    def pipe_fn():
+        frames, _ = fn.readers.video(
+            device="gpu", file_root=data, sequence_length=seq_len, stride=1,
+            step=seq_len,                 # consecutive, non-overlapping -> every frame once
+            random_shuffle=False, name="Reader", skip_vfr_check=True)
+        return frames
+
+    pipe = pipe_fn(batch_size=batch_size, num_threads=workers, device_id=0, seed=0)
+    pipe.build()
+    n_seq = pipe.epoch_size("Reader")
+    return pipe, n_seq
+
+
+def run_dali(pipe, n_seq, seq_len, batch_size):
+    import torch
+    n_iter = n_seq // batch_size          # drop the last partial batch (< batch_size sequences)
+    for _ in range(n_iter):
+        pipe.run()
+    torch.cuda.synchronize()
+    return n_iter * batch_size * seq_len
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--seq-len", type=int, default=256, help="DALI sequence length")
+    ap.add_argument("--batch-size", type=int, default=2, help="DALI batch size (sequences per iteration)")
+    ap.add_argument("--label", default="", help="resolution label written to the CSV, e.g. 1080p")
+    ap.add_argument("--out", default="", help="append results to this CSV")
+    ap.add_argument("--methods", nargs="+", default=["cpu", "ffmpeg-gpu", "dali"])
+    a = ap.parse_args()
+
+    files = list_videos(a.data)
+    print(f"{len(files)} videos in {a.data}", flush=True)
+    rows = []
+    for m in a.methods:
+        if m == "dali":
+            pipe, n_seq = make_dali(a.data, a.workers, a.seq_len, a.batch_size)
+            fn_run = lambda: run_dali(pipe, n_seq, a.seq_len, a.batch_size)
+        else:
+            fn_run = lambda m=m: run_ffmpeg(files, a.workers, gpu=(m == "ffmpeg-gpu"))
+        fn_run()                                   # warm-up (page cache, CUDA context)
+        rates, nvdec, frames = [], [], 0
+        for _ in range(a.repeats):
+            with DecoderMeter() as dm:
+                t = time.time(); frames = fn_run(); dt = time.time() - t
+            rates.append(frames / dt); nvdec.append(dm.mean)
+        r = statistics.median(rates)
+        rows.append((m, frames, r, statistics.pstdev(rates), statistics.mean(nvdec)))
+        print(f"{m:11s} {frames:7d} frames  {r:8.0f} frames/s  (NVDEC {rows[-1][4]:.0f}%)", flush=True)
+
+    if a.out:
+        import csv
+        new = not os.path.exists(a.out)
+        with open(a.out, "a", newline="") as f:
+            w = csv.writer(f)
+            if new:
+                w.writerow(["resolution", "method", "seq_len", "frames", "frames_per_s", "std", "nvdec_util"])
+            for m, fr, r, sd, nv in rows:
+                w.writerow([a.label, m, a.seq_len if m == "dali" else "", fr, round(r, 1), round(sd, 1), round(nv, 1)])
+
+    base = rows[0][2]
+    print(f"\n| method | frames decoded | frames/s | NVDEC util | vs CPU |\n|---|---|---|---|---|")
+    for m, fr, r, sd, nv in rows:
+        print(f"| {m} | {fr} | {r:,.0f} ± {sd:,.0f} | {nv:.0f}% | {r / base:.1f}× |")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+</details>
+
+**Setup:** same machine as section 13.6 (L40S, 8 cores, FFmpeg 6.1.1, DALI 2.4.0). Both sets are H.264 with a keyframe every 48 frames and contain the same 9 clips of 60 s (19,457 frames), cut from the YouTube downloads of the three Blender films (24 and 60 fps):
+
+- **1080p:** 1920 px wide (1920×1080, 1920×818 and 1920×800, depending on the film's aspect ratio).
+- **720p:** the same clips scaled to 1280 px wide (1280×720, 1280×546 and 1280×534).
+
+Median of 3 repeats after a warm-up pass; frames/s counts frames actually decoded.
+
+![Frames decoded per second for CPU FFmpeg, FFmpeg + NVDEC and DALI at 1080p and 720p](images/decode_compare.png)
+
+| Method | 1080p frames/s | 720p frames/s |
+|---|---|---|
+| CPU FFmpeg (8 cores) | 1,796 | **3,902** |
+| FFmpeg + NVDEC | **2,346** | 3,686 |
+| DALI (256-frame sequences) | 882 | 1,715 |
+
+NVDEC utilization during these runs: FFmpeg + NVDEC 80% (1080p) and 65% (720p); DALI 33% at both resolutions.
+
+![DALI decode speed against sequence length, compared with the two FFmpeg baselines](images/decode_dali_seq.png)
+
+| DALI sequence length | 1080p frames/s | 720p frames/s |
+|---|---|---|
+| 16 | 382 | 734 |
+| 64 | 702 | 1,352 |
+| 128 | 812 | 1,569 |
+| 256 | 882 | 1,715 |
+
+**What this shows:**
+
+1. **There is a crossover around 1080p.** At 1080p, NVDEC through FFmpeg is the fastest (1.3× the 8-core CPU). At 720p the CPU is slightly ahead (3,902 vs 3,686 fps), because each frame is cheap for the CPU while the GPU path still pays per-frame costs. As resolution drops further, CPU wins by more. I did not test 4K, where the gap should widen in the GPU's favor.
+2. **For full decoding, DALI was not the fastest at either resolution.** It reaches 38–47% of the FFmpeg + NVDEC speed. The DALI reader is built to *sample clips* for training (shuffling, strides, sharding), which is where it won in section 13.6. It works as a plain "decode everything" tool but is not optimized for it.
+3. **DALI's speed depends on sequence length.** It re-seeks to a keyframe for each sequence, so short sequences waste work: with a keyframe every 48 frames, going from 16-frame to 256-frame sequences more than doubles throughput at both resolutions (2.3× at 1080p, 2.3× at 720p). If you must decode everything with DALI, use long sequences. Batch size made no difference in my earlier 1080p tests (1, 8 and 32 gave the same result).
+4. **DALI used only about a third of the decoder.** NVDEC stayed at 33% in every DALI run, while FFmpeg's 8 parallel processes reached 80% at 1080p. The L40S has several NVDEC engines, and this is consistent with the DALI reader keeping only one of them busy. I did not confirm that, so treat it as a hypothesis.
+5. **Rule of thumb:** high-resolution video and many frames → GPU decoding pays off. At 720p or below, with plenty of CPU cores, plain CPU FFmpeg is hard to beat. Measure with your own files.
+
+**Why is DALI slower than the CPU here?**
+
+This is a fair question, because "GPU decoding" sounds like it should win. Here is what I measured and what I think explains it.
+
+*Measured:*
+
+- DALI's video reader decoded 882 frames/s at 1080p. The same GPU, driven by 8 FFmpeg processes, decoded 2,346 frames/s. So the GPU is not the limit; the way DALI's reader uses it is.
+- NVDEC (the GPU's hardware video decoder) was 33% busy in every DALI run and 65–80% busy in the FFmpeg runs.
+- DALI got faster as the sequence length grew (382 → 882 frames/s at 1080p, 734 → 1,715 at 720p), and batch size made no difference.
+
+*Likely reasons (inferred from the numbers above, not proven):*
+
+1. **The CPU baseline is strong.** It uses 8 modern CPU cores doing nothing but decoding, with an optimized software decoder: about 225 frames/s per core at 1080p. A fixed amount of GPU decoder hardware has to beat that.
+2. **DALI's reader appears to use one decoder engine.** The L40S has more than one NVDEC engine, and parallel FFmpeg processes spread across them. DALI's constant 33% fits a single busy engine. If the card has 3, FFmpeg's 2,346 frames/s is about 780 per engine, close to DALI's 882. I did not confirm the engine count or that DALI uses only one.
+3. **DALI's reader is designed for sampling clips, not for streaming a whole file.** For each sequence it seeks back to a keyframe and decodes forward. With a keyframe every 48 frames, short sequences decode frames that are then discarded, which is why longer sequences help. Training needs random clips from many videos, which is the case it is built and optimized for.
+4. **Both GPU paths pay fixed costs that the CPU does not.** Frames are copied or kept in GPU memory, and CUDA has to start up. This matters more at low resolution, where each frame is cheap for the CPU. That is why the CPU pulls ahead at 720p.
+
+*What this does not show:* that DALI is slow in general. The test counted only decode speed. It ignores CPU usage, where the CPU path used all 8 cores and DALI needed very few. That is the main reason to use DALI in training: it frees the CPU for other work. I did not run a test with fewer CPU cores, where I would expect the CPU path to slow down and DALI to stay about the same. For the clip-sampling workload DALI's reader was built for, it was 1.3–1.9× faster than the PyAV loader (section 13.6).
+
+**Bottom line:** if the job is "decode every frame as fast as possible", use FFmpeg with NVDEC at 1080p and above, or plain CPU FFmpeg at 720p and below, when you have spare cores. If the job is "feed random clips to a model while keeping the CPU free", DALI is the better tool.
+
+**Caveats:**
+
+- One GPU (L40S), one CPU (EPYC 9354, 8 cores), H.264 only, animation rather than camera footage. HEVC, AV1 or noisy footage will behave differently, and fewer CPU cores would favor the GPU more.
+- Small set: 9 clips per resolution. In earlier runs on a set of 256p clips, FFmpeg with `-hwaccel cuda` was dominated by process startup (0.62 s for one 600-frame clip versus 0.25 s on the CPU, mostly CUDA initialization). The same effect, to a smaller degree, is included in the FFmpeg + NVDEC numbers here, because it starts one process per file.
+- DALI delivers whole sequences, so it drops up to `sequence_length - 1` frames at the end of each video (18,432 of 19,457 frames for 256-frame sequences, 5% fewer than FFmpeg decodes). The speeds above count only frames actually delivered.
+- FFmpeg here discards frames (`-f null`). A real job also has to resize, copy or encode them, which costs both paths extra.
+- **Gotcha:** my first 1080p files were cut with `ffmpeg -c copy` at non-keyframe boundaries. FFmpeg decoded them (with `mmco: unref short failure` warnings) but DALI's reader aborted with `Current pipeline object is no longer valid`. Re-encode the clips (section 12.2) instead of stream-copying.
 
 ## 14. Beyond images and video (short overview)
 
@@ -1512,6 +1798,8 @@ Other readers you may need: `fn.readers.tfrecord`, `fn.readers.webdataset`, `fn.
 
 | Symptom | Cause / fix |
 |---|---|
+| `TypeError: Pipeline.__init__() got an unexpected keyword argument 'debug'` | In DALI 2.x, `debug=True` is only accepted by the experimental decorator: `from nvidia.dali.pipeline.experimental import pipeline_def` (section 11.4). |
+| `StopIteration` from a PyTorch DataLoader during your own benchmark | You asked for more batches than the dataset has (warm-up + measured). Imagenette train has only ~36 batches of 256. |
 | `RuntimeError: ... cannot be moved from GPU to CPU` | A CPU operator is getting GPU data. Move all CPU operations **before** the first GPU or `mixed` operator. |
 | Out of GPU memory after switching to DALI | DALI keeps its own memory pools. Lower `prefetch_queue_depth` or `batch_size`, or set `hw_decoder_load` / the decoder's memory padding. |
 | Epoch is shorter or longer than expected | Pass `reader_name="Reader"` to the iterator, and use `pad_last_batch=True` when sharding. |
@@ -1535,7 +1823,7 @@ Other readers you may need: `fn.readers.tfrecord`, `fn.readers.webdataset`, `fn.
 4. Use `DALIGenericIterator` to get GPU tensors in PyTorch without copies.
 5. Shard with `shard_id` / `num_shards` for multi-GPU training.
 6. Use `external_source` for data that isn't stored as files.
-7. **Benchmark** on your own hardware before and after.
+7. **Benchmark** on your own hardware before and after. In my test, DALI loaded images 7–19× faster and video 1.3–1.9× faster, but sped up ResNet-50 training by only 8%, because the model was already the bottleneck. DALI helps most when the input pipeline is what is holding the GPU back.
 
 ### References
 - Documentation: https://docs.nvidia.com/deeplearning/dali/user-guide/docs/

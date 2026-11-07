@@ -1,5 +1,5 @@
 --extra-index-url https://pypi.nvidia.com
-nvidia-dali-cuda120
+nvidia-dali-cuda120  # tested with 2.4.0
 torch
 torchvision
 nvidia-ml-py

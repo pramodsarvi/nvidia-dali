@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 from nvidia.dali.plugin.pytorch import DALIGenericIterator
 from train_dali import create_pipeline   # reuse the pipeline from Step 4
 
-DATA, BS, WORKERS, N_BATCHES = "imagenette2-320/train", 256, 8, 50
+DATA, BS, WORKERS, N_BATCHES = "imagenette2-320/train", 256, 8, 30  # Imagenette train has 9,469 imgs (~36 batches); keep warm-up + N_BATCHES below that
 
 def bench(loader, name, get_x):
     it = iter(loader)
